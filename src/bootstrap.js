@@ -25,6 +25,21 @@ const updater = require('./updater/updater');
 const moduleUpdater = require('./updater/moduleUpdater');
 const autoStart = require('./autoStart');
 
+const tracedSessions = new WeakSet();
+const formatCachedState = fromCache => fromCache === true ? 'yes' : fromCache === false ? 'no' : 'unknown';
+const traceRequests = ses => {
+  if (ses == null || tracedSessions.has(ses)) return;
+  tracedSessions.add(ses);
+
+  ses.webRequest.onCompleted(d => {
+    log('Request', d.method, d.url, `status=${d.statusCode}`, `cached=${formatCachedState(d.fromCache)}`);
+  });
+
+  ses.webRequest.onErrorOccurred(d => {
+    log('Request', d.method, d.url, `error=${d.error}`, `cached=${formatCachedState(d.fromCache)}`);
+  });
+};
+
 let desktopCore;
 const startCore = () => {
   if (oaConfig.js || oaConfig.css) session.defaultSession.webRequest.onHeadersReceived((d, cb) => {
@@ -95,16 +110,29 @@ const startCore = () => {
       }
     })
   });
+  log('Performance', 'desktop core started', performance.now());
 };
 
 const startUpdate = () => {
+  log('Performance', 'startUpdate', performance.now());
+  // traceRequests(session.defaultSession);
+
   const urls = [
     oaConfig.noTrack !== false ? 'https://*/api/*/science' : '',
     oaConfig.noTrack !== false ? 'https://*/api/*/metrics' : '',
     oaConfig.noTyping === true ? 'https://*/api/*/typing' : ''
   ].filter(x => x);
 
-  if (urls.length > 0) session.defaultSession.webRequest.onBeforeRequest({ urls }, (e, cb) => cb({ cancel: true }));
+  let firstScience = false;
+  if (urls.length > 0) session.defaultSession.webRequest.onBeforeRequest({ urls }, (e, cb) => {
+    if (!firstScience) {
+      log('Performance', 'first /science', performance.now());
+      firstScience = true;
+      process.exit();
+    }
+
+    cb({ cancel: true })
+  });
 
   const startMin = process.argv?.includes?.('--start-minimized');
 
@@ -122,6 +150,7 @@ const startUpdate = () => {
   }
 
   splash.events.once('APP_SHOULD_LAUNCH', () => {
+    log('Performance', 'APP_SHOULD_LAUNCH', performance.now());
     if (!process.env.OPENASAR_NOSTART) startCore();
   });
 
@@ -129,6 +158,7 @@ const startUpdate = () => {
   splash.events.once('APP_SHOULD_SHOW', () => {
     if (done) return;
     done = true;
+    log('Performance', 'APP_SHOULD_SHOW', performance.now());
 
     desktopCore.setMainWindowVisible(!startMin);
 
@@ -151,6 +181,7 @@ const startUpdate = () => {
 
 
 module.exports = () => {
+  log('Performance', 'bootstrap start', performance.now());
   app.on('second-instance', (e, a) => {
     desktopCore?.handleOpenUrl?.(a.includes('--url') && a[a.indexOf('--') + 1]); // Change url of main window if protocol is used (uses like "discord --url -- discord://example")
   });
