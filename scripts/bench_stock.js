@@ -8,6 +8,7 @@ const { tmpdir } = require('os');
 const DEFAULT_RUNS = Number.parseInt(process.env.OPENASAR_PERF_RUNS ?? '10', 10) || 10;
 const DEFAULT_APP_ASAR = process.env.OPENASAR_STOCK_APP_ASAR || '/opt/discord/resources/app.asar';
 const DEFAULT_APP_COMMAND = process.env.OPENASAR_STOCK_APP_COMMAND || 'discord';
+const RUN_TIMEOUT_MS = 20_000;
 const ANSI_PATTERN = /\x1B\[[0-?]*[ -/]*[@-~]/g;
 const PERFORMANCE_PATTERN = /Performance\]\s+(.*?)\s+(-?(?:\d+(?:\.\d+)?|\.\d+))\s*$/;
 
@@ -318,9 +319,22 @@ const patchFile = (filePath, patcher) => {
 };
 
 const patchStockBundle = extractedDir => {
-  const indexPath = join(extractedDir, 'app_bootstrap', 'index.js');
-  const bootstrapPath = join(extractedDir, 'app_bootstrap', 'bootstrap.js');
-  const splashScreenPath = join(extractedDir, 'app_bootstrap', 'splashScreen.js');
+  const stockRoot = join(extractedDir, 'app_bootstrap');
+  const openAsarRoot = join(extractedDir, 'index.js');
+
+  if (!readFileSafe(join(stockRoot, 'index.js'))) {
+    if (readFileSafe(openAsarRoot)) {
+      throw new Error(
+        `${DEFAULT_APP_ASAR} appears to contain OpenAsar, not stock Discord. Restore the original Discord app.asar or point OPENASAR_STOCK_APP_ASAR to a stock Discord archive.`
+      );
+    }
+
+    throw new Error(`Could not find stock Discord files in extracted archive at ${extractedDir}.`);
+  }
+
+  const indexPath = join(stockRoot, 'index.js');
+  const bootstrapPath = join(stockRoot, 'bootstrap.js');
+  const splashScreenPath = join(stockRoot, 'splashScreen.js');
 
   patchFile(indexPath, source => {
     let updated = replaceOnce(
@@ -426,6 +440,14 @@ const patchStockBundle = extractedDir => {
   });
 };
 
+const readFileSafe = filePath => {
+  try {
+    return readFileSync(filePath, 'utf8');
+  } catch {
+    return null;
+  }
+};
+
 const prepareInstrumentedAsar = appAsarPath => {
   const workDir = mkdtempSync(join(tmpdir(), 'openasar-bench-stock-'));
   const backupAsarPath = join(workDir, 'app.original.asar');
@@ -467,10 +489,22 @@ const installTerminationHandlers = () => {
   process.on('SIGTERM', () => terminate('SIGTERM'));
 };
 
-const runOnce = (runIndex, totalRuns, appArgs, colorEnabled) => new Promise((resolvePromise, reject) => {
+const killProcessGroup = child => {
+  if (child?.pid == null) return;
+
+  try {
+    process.kill(-child.pid, 'SIGKILL');
+  } catch {
+    try {
+      child.kill('SIGKILL');
+    } catch { }
+  }
+};
+
+const runAttempt = (runIndex, totalRuns, appArgs, colorEnabled, attempt) => new Promise((resolvePromise, reject) => {
   if (process.stdout.isTTY) {
     const styles = createStyles(colorEnabled);
-    process.stdout.write(`\x1b[2K\r${styles.dim(`Collecting run ${runIndex}/${totalRuns}...`)}`);
+    process.stdout.write(`\x1b[2K\r${styles.dim(`Collecting run ${runIndex}/${totalRuns} (attempt ${attempt})...`)}`);
   }
 
   let prepared;
@@ -504,11 +538,17 @@ const runOnce = (runIndex, totalRuns, appArgs, colorEnabled) => new Promise((res
   const child = spawn(DEFAULT_APP_COMMAND, appArgs, {
     cwd: repoRoot,
     env: process.env,
-    stdio: ['inherit', 'pipe', 'pipe']
+    stdio: ['inherit', 'pipe', 'pipe'],
+    detached: true
   });
 
   let stdout = '';
   let stderr = '';
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    killProcessGroup(child);
+  }, RUN_TIMEOUT_MS);
 
   child.stdout.on('data', chunk => {
     stdout += chunk.toString();
@@ -521,6 +561,7 @@ const runOnce = (runIndex, totalRuns, appArgs, colorEnabled) => new Promise((res
   });
 
   child.on('error', err => {
+    clearTimeout(timeout);
     try {
       cleanup();
     } catch (cleanupErr) {
@@ -532,6 +573,7 @@ const runOnce = (runIndex, totalRuns, appArgs, colorEnabled) => new Promise((res
   });
 
   child.on('close', code => {
+    clearTimeout(timeout);
     if (process.stdout.isTTY) process.stdout.write('\x1b[2K\r');
 
     let cleanupError = null;
@@ -548,6 +590,14 @@ const runOnce = (runIndex, totalRuns, appArgs, colorEnabled) => new Promise((res
     }
 
     const output = `${stdout}${stderr}`;
+    if (timedOut) {
+      const err = new Error(`Run ${runIndex} timed out after 20s on attempt ${attempt}, retrying...`);
+      err.retryable = true;
+      err.output = output;
+      reject(err);
+      return;
+    }
+
     if (code !== 0) {
       const err = new Error(`Run ${runIndex} failed with exit code ${code}`);
       err.output = output;
@@ -567,6 +617,17 @@ const runOnce = (runIndex, totalRuns, appArgs, colorEnabled) => new Promise((res
     resolvePromise(buildRunTimings(events));
   });
 });
+
+const runOnce = async (runIndex, totalRuns, appArgs, colorEnabled) => {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await runAttempt(runIndex, totalRuns, appArgs, colorEnabled, attempt);
+    } catch (err) {
+      if (!err.retryable) throw err;
+      console.error(err.message);
+    }
+  }
+};
 
 const main = async () => {
   installTerminationHandlers();

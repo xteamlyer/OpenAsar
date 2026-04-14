@@ -1,15 +1,17 @@
 #!/usr/bin/env node
 
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const { resolve } = require('path');
 
 const DEFAULT_RUNS = Number.parseInt(process.env.OPENASAR_PERF_RUNS ?? '10', 10) || 10;
+const DEFAULT_APP_ASAR = process.env.OPENASAR_PERF_APP_ASAR || '/opt/discord/resources/app.asar';
+const DEFAULT_APP_COMMAND = process.env.OPENASAR_PERF_APP_COMMAND || 'discord';
+const RUN_TIMEOUT_MS = 20_000;
 const ANSI_PATTERN = /\x1B\[[0-?]*[ -/]*[@-~]/g;
 const PERFORMANCE_PATTERN = /Performance\]\s+(.*?)\s+(-?(?:\d+(?:\.\d+)?|\.\d+))\s*$/;
 
 const scriptDir = __dirname;
 const repoRoot = resolve(scriptDir, '..');
-const runScript = resolve(scriptDir, process.env.OPENASAR_PERF_RUN_SCRIPT || 'run.sh');
 
 const stripAnsi = text => text.replace(ANSI_PATTERN, '');
 
@@ -93,7 +95,7 @@ const parseArgs = argv => {
 };
 
 const usage = () => [
-  'Usage: ./scripts/averageStartup.js [--runs N] [--color|--no-color] [--] [args for run.sh]',
+  'Usage: ./scripts/averageStartup.js [--runs N] [--color|--no-color] [--] [args for discord]',
   '',
   'Examples:',
   '  ./scripts/averageStartup.js',
@@ -269,20 +271,73 @@ const renderReport = ({ rows, totalStats, scaleMax }, runCount, colorEnabled) =>
   ].join('\n');
 };
 
-const runOnce = (runIndex, totalRuns, runArgs, colorEnabled) => new Promise((resolvePromise, reject) => {
-  if (process.stdout.isTTY) {
-    const styles = createStyles(colorEnabled);
-    process.stdout.write(`\x1b[2K\r${styles.dim(`Collecting run ${runIndex}/${totalRuns}...`)}`);
+const checkedSpawnSync = (command, args, options = {}) => {
+  const result = spawnSync(command, args, {
+    cwd: repoRoot,
+    encoding: 'utf8',
+    stdio: ['inherit', 'pipe', 'pipe'],
+    ...options
+  });
+
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    const joined = [result.stdout, result.stderr].filter(Boolean).join('');
+    throw new Error(`${command} ${args.join(' ')} failed with exit code ${result.status}${joined ? `\n${joined}` : ''}`);
   }
 
-  const child = spawn('sh', [runScript, ...runArgs], {
+  return result;
+};
+
+const checkedElevatedCopy = (from, to) => {
+  const result = spawnSync('sudo', ['cp', from, to], {
+    cwd: repoRoot,
+    stdio: 'inherit'
+  });
+
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(`sudo cp ${from} ${to} failed with exit code ${result.status}`);
+  }
+};
+
+const prepareBenchmarkApp = () => {
+  const builtAsarPath = resolve(repoRoot, 'app.asar');
+  checkedSpawnSync('asar', ['pack', 'src', builtAsarPath]);
+  checkedElevatedCopy(builtAsarPath, DEFAULT_APP_ASAR);
+};
+
+const killProcessGroup = child => {
+  if (child?.pid == null) return;
+
+  try {
+    process.kill(-child.pid, 'SIGKILL');
+  } catch {
+    try {
+      child.kill('SIGKILL');
+    } catch { }
+  }
+};
+
+const runAttempt = (runIndex, totalRuns, runArgs, colorEnabled, attempt) => new Promise((resolvePromise, reject) => {
+  if (process.stdout.isTTY) {
+    const styles = createStyles(colorEnabled);
+    process.stdout.write(`\x1b[2K\r${styles.dim(`Collecting run ${runIndex}/${totalRuns} (attempt ${attempt})...`)}`);
+  }
+
+  const child = spawn(DEFAULT_APP_COMMAND, runArgs, {
     cwd: repoRoot,
     env: process.env,
-    stdio: ['inherit', 'pipe', 'pipe']
+    stdio: ['inherit', 'pipe', 'pipe'],
+    detached: true
   });
 
   let stdout = '';
   let stderr = '';
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    killProcessGroup(child);
+  }, RUN_TIMEOUT_MS);
 
   child.stdout.on('data', chunk => {
     stdout += chunk.toString();
@@ -294,12 +349,23 @@ const runOnce = (runIndex, totalRuns, runArgs, colorEnabled) => new Promise((res
     process.stderr.write(text);
   });
 
-  child.on('error', reject);
+  child.on('error', err => {
+    clearTimeout(timeout);
+    reject(err);
+  });
 
   child.on('close', code => {
+    clearTimeout(timeout);
     if (process.stdout.isTTY) process.stdout.write('\x1b[2K\r');
 
     const output = `${stdout}${stderr}`;
+    if (timedOut) {
+      const err = new Error(`Run ${runIndex} timed out after 20s on attempt ${attempt}, retrying...`);
+      err.retryable = true;
+      err.output = output;
+      return reject(err);
+    }
+
     if (code !== 0) {
       const err = new Error(`Run ${runIndex} failed with exit code ${code}`);
       err.output = output;
@@ -318,12 +384,25 @@ const runOnce = (runIndex, totalRuns, runArgs, colorEnabled) => new Promise((res
   });
 });
 
+const runOnce = async (runIndex, totalRuns, runArgs, colorEnabled) => {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await runAttempt(runIndex, totalRuns, runArgs, colorEnabled, attempt);
+    } catch (err) {
+      if (!err.retryable) throw err;
+      console.error(err.message);
+    }
+  }
+};
+
 const main = async () => {
   const options = parseArgs(process.argv.slice(2));
   if (options.help) {
     console.log(usage());
     return;
   }
+
+  prepareBenchmarkApp();
 
   const runs = [];
   for (let i = 1; i <= options.runs; i++) {
@@ -337,6 +416,7 @@ module.exports = {
   buildRunTimings,
   computeStats,
   parsePerformanceEvents,
+  prepareBenchmarkApp,
   renderReport,
   summarizeRuns
 };
