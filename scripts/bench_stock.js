@@ -292,15 +292,15 @@ const checkedSpawnSync = (command, args, options = {}) => {
   return result;
 };
 
-const checkedElevatedCopy = (from, to) => {
-  const result = spawnSync('sudo', ['cp', from, to], {
-    cwd: repoRoot,
-    stdio: 'inherit'
-  });
+const checkedCopy = (from, to) => {
+  try {
+    copyFileSync(from, to);
+  } catch (err) {
+    if (err?.code === 'EACCES' || err?.code === 'EPERM') {
+      throw new Error(`copy ${from} ${to} failed: ${to} is not writable. Run the script with write access to ${to} or set OPENASAR_STOCK_APP_ASAR to a writable stock app.asar path.`);
+    }
 
-  if (result.error) throw result.error;
-  if (result.status !== 0) {
-    throw new Error(`sudo cp ${from} ${to} failed with exit code ${result.status}`);
+    throw err;
   }
 };
 
@@ -466,7 +466,7 @@ const cleanupPreparedRun = prepared => {
   if (prepared == null) return;
 
   try {
-    checkedElevatedCopy(prepared.backupAsarPath, DEFAULT_APP_ASAR);
+    checkedCopy(prepared.backupAsarPath, DEFAULT_APP_ASAR);
   } finally {
     rmSync(prepared.workDir, { recursive: true, force: true });
   }
@@ -512,7 +512,7 @@ const runAttempt = (runIndex, totalRuns, appArgs, colorEnabled, attempt) => new 
   try {
     prepared = prepareInstrumentedAsar(DEFAULT_APP_ASAR);
     activeRunCleanup = () => cleanupPreparedRun(prepared);
-    checkedElevatedCopy(prepared.instrumentedAsarPath, DEFAULT_APP_ASAR);
+    checkedCopy(prepared.instrumentedAsarPath, DEFAULT_APP_ASAR);
   } catch (err) {
     if (process.stdout.isTTY) process.stdout.write('\x1b[2K\r');
     activeRunCleanup = null;

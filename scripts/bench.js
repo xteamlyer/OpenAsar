@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 const { spawn, spawnSync } = require('child_process');
+const { copyFileSync } = require('fs');
 const { resolve } = require('path');
 
 const DEFAULT_RUNS = Number.parseInt(process.env.OPENASAR_PERF_RUNS ?? '10', 10) || 10;
@@ -288,22 +289,22 @@ const checkedSpawnSync = (command, args, options = {}) => {
   return result;
 };
 
-const checkedElevatedCopy = (from, to) => {
-  const result = spawnSync('sudo', ['cp', from, to], {
-    cwd: repoRoot,
-    stdio: 'inherit'
-  });
+const checkedCopy = (from, to) => {
+  try {
+    copyFileSync(from, to);
+  } catch (err) {
+    if (err?.code === 'EACCES' || err?.code === 'EPERM') {
+      throw new Error(`copy ${from} ${to} failed: ${to} is not writable. Run the script with write access to ${to} or set OPENASAR_PERF_APP_ASAR to a writable app.asar path.`);
+    }
 
-  if (result.error) throw result.error;
-  if (result.status !== 0) {
-    throw new Error(`sudo cp ${from} ${to} failed with exit code ${result.status}`);
+    throw err;
   }
 };
 
 const prepareBenchmarkApp = () => {
   const builtAsarPath = resolve(repoRoot, 'app.asar');
   checkedSpawnSync('asar', ['pack', 'src', builtAsarPath]);
-  checkedElevatedCopy(builtAsarPath, DEFAULT_APP_ASAR);
+  checkedCopy(builtAsarPath, DEFAULT_APP_ASAR);
 };
 
 const killProcessGroup = child => {
