@@ -7,11 +7,15 @@ let launched, win;
 
 
 exports.initSplash = (startMin) => {
+  log('Performance', 'initSplash start', performance.now());
+
   const inst = updater.getUpdater();
   if (inst) initNew(inst);
     else initOld();
+  log('Performance', 'inited updater', performance.now());
 
   launchSplash(startMin);
+  log('Performance', 'launched splash', performance.now());
 
 
   if (process.env.OPENASAR_QUICKSTART || oaConfig.quickstart) setTimeout(() => {
@@ -69,7 +73,8 @@ const launchSplash = (startMin) => {
   ipcMain.on('ss', launchMain);
   ipcMain.on('sq', app.quit);
 
-  if (!startMin) win.once('ready-to-show', win.show);
+  win.once('ready-to-show', () => log('Performance', 'splash ready-to-show', performance.now()));
+  // if (!startMin) win.once('ready-to-show', win.show);
 };
 
 
